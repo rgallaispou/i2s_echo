@@ -26,6 +26,10 @@ const struct device *const i2s_dev_tx = DEVICE_DT_GET(DT_NODELABEL(i2s_tx));
 const struct device *const codec_dev = DEVICE_DT_GET(DT_NODELABEL(audio_codec));
 #endif
 
+#ifdef CONFIG_AUDIO_DMIC
+const struct device *const dmic_dev = DEVICE_DT_GET(DT_NODELABEL(dmic0));
+#endif
+
 #define SAMPLE_FREQUENCY   (44100)
 #define SAMPLE_BIT_WIDTH   (16)
 #define NUMBER_OF_CHANNELS (2U)
@@ -56,6 +60,9 @@ static STRUCT_SECTION_ITERABLE(k_mem_slab,
 
 static struct i2s_config i2s_rx_cfg;
 static struct i2s_config i2s_tx_cfg;
+#ifdef CONFIG_AUDIO_DMIC
+static struct dmic_cfg dmic_cfg;
+#endif
 
 static int configure_i2s_stream(const struct device *dev, enum i2s_dir dir, i2s_opt_t options,
 				struct i2s_config *cfg)
@@ -86,6 +93,39 @@ static int configure_i2s_stream(const struct device *dev, enum i2s_dir dir, i2s_
 	return ret;
 }
 
+#ifdef CONFIG_AUDIO_DMIC
+static int configure_dmic_stream(const struct device *dev, struct dmic_cfg *cfg)
+{
+	int ret;
+
+	struct pcm_stream_cfg stream = {
+		.pcm_width = SAMPLE_BIT_WIDTH,
+		.mem_slab  = &mem_slab,
+	};
+
+	cfg->io.min_pdm_clk_freq = 1000000,
+	cfg->io.max_pdm_clk_freq = 3500000,
+	cfg->io.min_pdm_clk_dc   = 40,
+	cfg->io.max_pdm_clk_dc   = 60,
+	cfg->streams = &stream,
+	cfg->channel.req_num_streams = 1;
+
+	cfg.channel.req_num_chan = 1;
+	cfg.channel.req_chan_map_lo =
+		dmic_build_channel_map(0, PDM_CTL_IDX, PDM_CHAN_LEFT);
+	cfg.streams[0].pcm_rate = MAX_SAMPLE_RATE;
+	cfg.streams[0].block_size =
+		BLOCK_SIZE(cfg.streams[0].pcm_rate, cfg.channel.req_num_chan);
+
+	ret = dmic_configure(dmic_dev, cfg);
+	if (ret < 0) {
+		LOG_ERR("Failed to configure the driver: %d", ret);
+	}
+
+	return ret;
+}
+#endif
+
 #define I2S_CONTROLLER I2S_OPT_BIT_CLK_CONTROLLER | I2S_OPT_FRAME_CLK_CONTROLLER
 #define I2S_TARGET     I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET
 
@@ -98,6 +138,19 @@ int main(void)
 
 	/* configure i2s for audio record */
 	configure_i2s_stream(i2s_dev_rx, I2S_DIR_RX, I2S_TARGET, &i2s_rx_cfg);
+
+#ifdef CONFIG_AUDIO_DMIC
+	if (!device_is_ready(dmic_dev)) {
+		LOG_ERR("%s is not ready", dmic_dev->name);
+		return 0;
+	}
+
+	ret = configure_dmic_stream(dmic_dev, &dmic_cfg);
+	if (ret < 0) {
+		LOG_ERR("dmic confuguration failed: %d", ret);
+		return 0;
+	}
+#endif
 
 	k_msleep(100);
 
@@ -133,19 +186,34 @@ int main(void)
 	if (ret != 0) {
 		LOG_ERR("i2s_trigger TX failed with %d error", ret);
 		return ret;
-	} 
+	}
 
+#ifdef CONFIG_AUDIO_CODEC
+	ret = dmic_trigger(dmic_dev, DMIC_TRIGGER_START);
+	if (ret < 0) {
+		LOG_ERR("START trigger failed: %d", ret);
+		return ret;
+	}
+#endif
 
 	while (true) {
 		uint32_t block_size;
 		void *rx_block;
 		void *tx_block;
 
+#ifdef CONFIG_AUDIO_DMIC
+		ret = dmic_read(dmic_dev, 0, &rx_block, &block_size, READ_TIMEOUT);
+		if (ret < 0) {
+			LOG_ERR("%d - read failed: %d", i, ret);
+			return ret;
+		}
+#else
 		ret = i2s_read(i2s_dev_rx, &rx_block, &block_size);
 		if (ret != 0) {
 			LOG_ERR("i2s_read failed with %d error", ret);
 			continue;
 		}
+#endif
 
 		ret = k_mem_slab_alloc(&tx_mem_slab, &tx_block, K_NO_WAIT);
 		if (ret != 0) {
@@ -162,7 +230,6 @@ int main(void)
 			LOG_ERR("i2s_write failed with %d error", ret);
 		}
 	}
-
 
 	return 0;
 }
